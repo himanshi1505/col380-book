@@ -1,0 +1,1244 @@
+% ch25.tex  --  Parallel Algorithms (Graph Algorithms)
+
+\tcbset{ppbox/.append style={after title={\par\smallskip}}}
+
+\chapter{Parallel Graph Algorithms}
+
+%------------------------------------------------------------------
+% Learning outcomes
+%------------------------------------------------------------------
+\begin{ppkey}
+After studying this chapter you should be able to:
+\begin{itemize}
+  \item Explain why breadth-first search (BFS) is naturally parallelisable
+        whereas depth-first search (DFS) is not, and identify the structural
+        property of a graph that drives this difference.
+  \item Implement a level-synchronous parallel BFS using a compare-and-swap
+        (CAS) primitive to coordinate updates to the next-frontier set.
+  \item Analyse the work and span of parallel BFS under perfect and uneven
+        load distribution, and explain why the graph diameter is the right
+        proxy for parallelism.
+  \item Describe the work-pool (depth-biased) parallel search algorithm and
+        explain how the choice of bag, stack, or queue changes the discovery
+        order.
+  \item Decompose parallel DFS into a divide-and-conquer scheme: spine
+        identification, component decomposition, recursive DFS on
+        components, and final merge.
+  \item Implement a parallel Kruskal's algorithm using parallel merge sort,
+        Bor\r{u}vka rounds, parallel-scan deduplication, and parallel
+        union--find with pointer jumping.
+  \item Recall the recurrence for parallel merge ($T(n) = T(3n/4) + O(\log n)$)
+        and reason about its closed form.
+\end{itemize}
+\end{ppkey}
+
+%==================================================================
+\section{Introduction}
+%==================================================================
+
+The earlier chapters in the parallel-algorithms thread covered parallel
+prefix sum and parallel radix sort.  Both are not just academic
+constructions: parallel prefix sum sits at the core of large-scale web
+services, distributed databases, and analytical engines such as Google
+BigQuery, DuckDB, and Apache Spark, while parallel radix sort underlies
+GPU libraries (NVIDIA Thrust), particle simulators, and search engines
+such as Elasticsearch.  These ideas now feed directly into the most
+common building blocks of large-scale computing: \emph{graph algorithms}.
+
+Most non-trivial parallel systems eventually reduce to a graph problem.
+Compilers turn programs into control-flow graphs; SAT solvers explore
+implication graphs; chip layout tools traverse netlists; recommender
+systems walk billion-edge social graphs.  This chapter develops the
+parallel versions of two foundational primitives, BFS and DFS, and uses
+DFS as a vehicle to introduce a small ecosystem of supporting parallel
+graph algorithms (parallel merge sort, parallel Kruskal's, Bor\r{u}vka
+rounds, and parallel union--find).
+
+\begin{ppexample}
+A web crawler indexes pages by following hyperlinks.  Starting from a
+seed URL, it discovers neighbours one ``hop'' away, then two hops away,
+and so on.  This is BFS on the web graph.  At each level the crawler can
+fan out to many threads, because all unvisited pages reachable in
+exactly $k$ hops are independent of each other.  The bottleneck is not
+the algorithm; it is the coordination needed to mark a URL as
+``already seen'' without two crawlers indexing the same page twice.
+This is exactly the role played by the CAS primitive in the parallel
+BFS skeleton developed below.
+\end{ppexample}
+
+\begin{ppexample}
+A modern SAT solver based on the CDCL (conflict-driven clause learning)
+algorithm performs a depth-first search of the assignment space, with
+non-chronological backtracking.  Industrial instances easily reach
+millions of variables and millions of clauses, and applications include
+chip layout, traffic-controller synthesis, and even cell-evolution
+models used in cancer prognosis.  Without an effective parallel DFS,
+these instances cannot be tackled at scale.  Designing a faithful
+parallel DFS that still produces a \emph{valid} DFS tree is an active
+open research problem; it is one of the strongest motivators for the
+divide-and-conquer scheme presented in
+Section~\ref{sec:dnc-dfs}.
+\end{ppexample}
+
+\begin{ppexample}
+Suppose we apply BFS from a single source to a road network of
+$|V| = 10^7$ junctions and $|E| = 2.5 \times 10^7$ road segments.
+The work is $\Theta(V + E)$, but the natural parallel time depends on
+the \emph{diameter} of the graph: a long, thin road network with
+diameter $\sim 10^4$ leaves the BFS little room to fan out, while a
+densely connected city centre with diameter $\sim 50$ exposes massive
+parallelism per level.  Two graphs with identical $|V|$ and $|E|$ can
+behave very differently in practice---a recurring theme of this
+chapter.
+\end{ppexample}
+
+%==================================================================
+\section{Parallel Breadth-First Search}
+%==================================================================
+
+Among the two classical graph traversals, BFS is the one that
+parallelises naturally.  The reason is structural: every node at a
+given BFS level (\emph{the frontier}) is independent of every other
+node at the same level, in the sense that no edge is forced to be
+traversed before any other.  Once we have the current frontier, we can
+hand each frontier vertex to a different thread and let them all
+expand their neighbourhoods in parallel.
+
+\begin{ppdefn}
+The \ppterm{frontier} at level $d$ of a BFS rooted at source $s$ is the
+set of all vertices whose shortest-path distance from $s$ equals $d$.
+A \ppterm{level-synchronous parallel BFS} processes one frontier at a
+time: in iteration $d$ all vertices in the level-$d$ frontier are
+expanded in parallel to produce the level-$(d{+}1)$ frontier.
+\end{ppdefn}
+
+%------------------------------------------------------------------
+\subsection{The Algorithm}
+%------------------------------------------------------------------
+
+The skeleton is short.  We maintain three data structures: the current
+\texttt{frontier} (initially the singleton $\{s\}$), a bit-vector
+\texttt{visited} (initially all zero except for the source), and an
+array \texttt{distance} that records the BFS distance from $s$.  The
+variable \texttt{level} tracks the current depth.
+
+\begin{verbatim}
+frontier = {source}
+visited[source] = true
+distance[source] = 0
+level = 0
+
+while frontier is not empty:
+    next_frontier = {}                      // shared structure
+    parallel for each node u in frontier:
+        parallel for each neighbour v of u:
+            if CAS(&visited[v], false, true):
+                distance[v] = level + 1
+                next_frontier.insert(v)
+    frontier = next_frontier
+    level++
+\end{verbatim}
+
+The two \texttt{parallel for} loops express the two natural levels of
+parallelism: across vertices in the frontier, and across the neighbours
+of a single frontier vertex.
+
+\begin{ppexample}
+\textbf{Dry run of parallel BFS.}
+Consider the graph $G = (V, E)$ with $V = \{A, B, C, D, E, F, G\}$
+and edges
+\[
+\begin{aligned}
+E \;=\; \{(A,B),\; (A,C),\; (B,D),\; (B,E),\; (C,E),\; (C,F),\\
+\qquad (D,G),\; (E,G),\; (F,G)\}.
+\end{aligned}
+\]
+Run parallel BFS from source $A$ on $p = 2$ threads $T_1, T_2$.
+Initially $\texttt{frontier} = \{A\}$, $\texttt{visited}[A] =
+\texttt{true}$, $\texttt{distance}[A] = 0$, $\texttt{level} = 0$.
+
+\paragraph{Iteration 1 (level = 0).}
+Only $A$ is in the frontier; $T_1$ takes it.  $A$'s neighbours are
+$\{B, C\}$.  $T_1$ runs CAS on each:
+\begin{itemize}
+  \item $\textsf{CAS}(\&\texttt{visited}[B], \texttt{false}, \texttt{true})$
+        succeeds; $\texttt{distance}[B] = 1$, insert $B$.
+  \item $\textsf{CAS}(\&\texttt{visited}[C], \texttt{false}, \texttt{true})$
+        succeeds; $\texttt{distance}[C] = 1$, insert $C$.
+\end{itemize}
+After: $\texttt{frontier} = \{B, C\}$, $\texttt{level} = 1$.
+
+\paragraph{Iteration 2 (level = 1).}
+$T_1$ owns $B$, $T_2$ owns $C$.
+
+\smallskip
+$T_1$ on $B$, neighbours $\{A, D, E\}$:
+\begin{itemize}
+  \item $A$: CAS fails (already visited).
+  \item $D$: CAS succeeds; $\texttt{distance}[D] = 2$, insert $D$.
+  \item $E$: race with $T_2$.  Suppose $T_1$ wins the CAS;
+        $\texttt{distance}[E] = 2$, insert $E$.
+\end{itemize}
+
+\smallskip
+$T_2$ on $C$, neighbours $\{A, E, F\}$:
+\begin{itemize}
+  \item $A$: CAS fails.
+  \item $E$: CAS \emph{fails} because $T_1$ already flipped
+        $\texttt{visited}[E]$.  $T_2$ does not insert $E$ again ---
+        this is the bug CAS prevents.
+  \item $F$: CAS succeeds; $\texttt{distance}[F] = 2$, insert $F$.
+\end{itemize}
+
+After: $\texttt{frontier} = \{D, E, F\}$, $\texttt{level} = 2$.
+
+\paragraph{Iteration 3 (level = 2).}
+Three vertices, two threads, dynamic schedule.  Suppose $T_1$ takes
+$D$, $T_2$ takes $E$, and the first to finish takes $F$.
+
+\smallskip
+$T_1$ on $D$, neighbours $\{B, G\}$: $B$ fails; $G$ races with $T_2$.
+$T_2$ on $E$, neighbours $\{B, C, G\}$: $B$ and $C$ fail; $G$ races
+with $T_1$.  Exactly one of them wins the CAS on $G$; say $T_1$ does.
+Then $\texttt{distance}[G] = 3$, $G$ inserted.  When the loser later
+picks up $F$ and inspects $G$, the CAS on $G$ fails and $G$ is not
+re-inserted.
+
+After: $\texttt{frontier} = \{G\}$, $\texttt{level} = 3$.
+
+\paragraph{Iteration 4 (level = 3).}
+$G$ has no unvisited neighbours; \texttt{next\_frontier} is empty
+and the loop exits.
+
+\paragraph{Final BFS distances.}
+\[
+  d(A){=}0,\quad d(B){=}d(C){=}1,\quad d(D){=}d(E){=}d(F){=}2,\quad
+  d(G){=}3.
+\]
+Every vertex was inserted into exactly one frontier, even though $E$
+was discovered by both $T_1$ and $T_2$ and $G$ was discovered by
+both the $D$-owner and the $E$-owner.  CAS is the only thing that
+prevented duplicate insertions.
+\end{ppexample}
+
+%------------------------------------------------------------------
+\subsection{Why CAS?}
+%------------------------------------------------------------------
+
+The same vertex $v$ can be a neighbour of two distinct frontier
+vertices $u$ and $u'$ owned by different threads.  Both threads will
+race to mark $v$ as visited and to insert it into the next frontier.
+Without coordination, $v$ would be inserted twice (or more).  We
+therefore guard the discovery step by a \emph{compare-and-swap}:
+
+\begin{ppdefn}
+\ppterm{Compare-and-swap}, $\textsf{CAS}(\&x, \mathit{old}, \mathit{new})$,
+atomically reads the location $x$, compares its value to
+$\mathit{old}$, and---if they match---writes $\mathit{new}$ in its
+place, returning \texttt{true}.  Otherwise it leaves $x$ unchanged and
+returns \texttt{false}.
+\end{ppdefn}
+
+In the BFS skeleton, exactly one thread succeeds in flipping
+\texttt{visited[v]} from \texttt{false} to \texttt{true}, and only that
+thread inserts $v$ into the next frontier and writes $v$'s distance.
+All other concurrent attempts fail and silently move on.  This
+guarantees that each vertex is added to a frontier exactly once.
+
+\begin{ppnote}
+The CAS-based skeleton is the simplest version that is correct.  It
+already gives an effective speedup on dense graphs, but it leaves
+several optimisations on the table; we discuss them next.
+\end{ppnote}
+
+%------------------------------------------------------------------
+\subsection{Challenges and Considerations}
+%------------------------------------------------------------------
+
+\paragraph{Shared next-frontier structure.}
+The \texttt{next\_frontier} is a shared data structure that every
+expanding thread tries to write to.  CAS makes it correct, but contention
+on a single shared list scales poorly.  A standard refinement is to
+implement \texttt{next\_frontier} as a \emph{lock-free queue} (or
+lock-free bag), so that insertions can proceed without blocking even
+when many threads contribute simultaneously.
+
+\paragraph{Load imbalance.}
+The skeleton assumes all vertices in the frontier do roughly the same
+amount of work.  In practice the degree distribution is highly skewed:
+one vertex may have just a few neighbours while another has thousands.
+A static partition of the frontier across threads then leaves some
+threads idle while others struggle.  The fix is to make the schedule
+\emph{dynamic}.  The standard mechanism is a \ppterm{work-stealing
+queue}~\cite{blumofe1999}: each thread has its own queue of pending tasks, and an idle
+thread \emph{steals} from a busy thread's queue when its own runs dry.
+
+\begin{ppnote}
+Work stealing is due to Charles E.~Leiserson~\cite{blumofe1999}, who introduced it as the
+runtime mechanism behind the \textsc{Cilk} programming language~\cite{frigo1998cilk}.
+\textsc{Cilk} exposed only two parallel primitives, \texttt{spawn} and
+\texttt{sync}, and left the rest of parallelism (assignment of tasks to
+threads, dynamic load balancing) to the compiler and runtime.  The
+\textsc{Cilk} technology was later acquired by Intel and re-christened
+as \emph{Intel Threading Building Blocks} (TBB).  Its work-stealing
+runtime is what makes the abstraction practical.
+\end{ppnote}
+
+\paragraph{Direction-optimising BFS.}
+For very large graphs whose frontiers grow rapidly, an additional optimisation called \ppterm{direction-optimising BFS}~\cite{beamer2012} switches between
+a top-down expansion (each frontier vertex pushes to its unvisited
+neighbours) and a bottom-up expansion (each unvisited vertex pulls from
+visited neighbours).  This is especially effective for graphs that
+consist of dense clusters connected by few inter-cluster edges, where a
+small number of giant frontiers dominate the runtime.  The technique is
+not pursued further in this chapter.
+
+%------------------------------------------------------------------
+\subsection{Complexity}
+%------------------------------------------------------------------
+
+The sequential BFS has work $\Theta(V + E)$.
+
+\begin{ppdefn}
+Under the assumption of \emph{perfectly balanced} workload across $p$
+processors, the parallel BFS achieves
+\[
+  T_p \;=\; O\!\left(\frac{V + E}{p}\right).
+\]
+\end{ppdefn}
+
+The ``perfectly balanced'' caveat is essential.  Work at each level is
+highly uneven, and the right model is level-by-level.  Let
+\[
+  W_d \;=\; \sum_{u \in \mathrm{frontier}_d} \deg(u)
+\]
+be the total work at level $d$.  Then the ideal parallel time is
+\[
+  T_p \;=\; \sum_{d} O\!\left(\frac{W_d}{p}\right) \;+\;
+            O(\text{sync cost})
+        \;=\; O\!\left(\frac{E}{p}\right) \;+\; k,
+\]
+where $k$ is the number of BFS levels.
+
+\begin{ppkey}
+Two graphs with the same $|V|$ and $|E|$ can have very different
+numbers of BFS levels and hence very different parallel runtimes.  The
+asymptotic bound $O((V+E)/p)$ does not capture this; the right proxy
+is the \emph{graph diameter}.  Graphs with small diameter are highly
+parallelisable; graphs with large diameter are dominated by long
+sequential chains and resist parallelism.
+\end{ppkey}
+
+\begin{pppitfall}
+Reporting only $O((V+E)/p)$ for a parallel BFS is misleading.  Two
+implementations on the same $(V, E)$ graph can differ by an order of
+magnitude depending on diameter, degree distribution, and the choice
+of frontier data structure.  Always report the diameter and the
+maximum frontier size alongside the speedup curve.
+\end{pppitfall}
+
+
+%==================================================================
+\section{Parallel Depth-First Search}
+%==================================================================
+
+DFS is fundamentally harder to parallelise than BFS, for one
+overarching reason: DFS imposes a strict \emph{order} on the discovery
+of vertices, and that order creates long sequential chains.  Any
+attempt to expand multiple branches at once destroys the depth-first
+discipline.
+
+\begin{ppdefn}
+A \ppterm{DFS tree} of a graph $G = (V, E)$ rooted at a vertex $r$ is
+a rooted spanning tree $T \subseteq G$ such that every non-tree edge
+of $G$ joins a vertex to one of its ancestors or descendants in $T$.
+Equivalently, $T$ is the spanning tree obtained by following only the
+edges that lead to newly-discovered vertices during a depth-first
+traversal of $G$.
+\end{ppdefn}
+
+The defining structural property---no non-tree edge crosses between
+two unrelated branches of $T$---is what makes DFS so useful (and so
+hard to parallelise).  Two parallel difficulties stack on top of each
+other:
+
+\begin{itemize}
+  \item Constructing \emph{some} valid DFS tree is already hard to
+        parallelise.
+  \item Constructing a \emph{specific} DFS order (e.g.\ ``always pick
+        the smallest-numbered neighbour first'') is even harder.
+\end{itemize}
+
+\begin{ppexample}
+\textbf{The naive parallel DFS.}
+The most obvious attempt is to start from a vertex $A$ with neighbours
+$\{B, C\}$ and explore $B$ and $C$ simultaneously on two threads:
+\[
+  \text{Thread 1: } A \to B \to D, E \qquad
+  \text{Thread 2: } A \to C \to \cdots
+\]
+The discovery pattern is no longer depth-first; it is parallel
+graph traversal.  Even if both subtrees are valid trees, their union
+is not necessarily a DFS tree of the original graph: a non-tree edge
+between $D$ and $C$ would not satisfy the ancestor/descendant
+condition.  The naive scheme produces a spanning tree, not a DFS tree.
+\end{ppexample}
+
+%------------------------------------------------------------------
+\subsection{Work-Pool Parallel Search (Depth-Biased)}
+%------------------------------------------------------------------
+
+A more disciplined attempt gives up on producing a strict DFS tree but
+keeps the spirit of depth-first exploration.  This is sometimes called
+\ppterm{depth-biased parallel search}.
+
+\paragraph{Algorithm.}
+Maintain a shared bag $\mathcal{B}$ of frontier vertices.  Multiple
+processors repeatedly do the following:
+\begin{enumerate}
+  \item Remove a vertex $u$ from $\mathcal{B}$.
+  \item Inspect the adjacency list of $u$.
+  \item For each unvisited neighbour $v$, \emph{try} to mark $v$ as
+        visited (atomically).
+  \item If the marking succeeds, set $\mathit{parent}[v] = u$ and
+        insert $v$ into $\mathcal{B}$.
+\end{enumerate}
+
+The atomic ``try to mark'' step is essential.  Without it, two threads
+could both succeed in marking the same $v$ as visited, each writing a
+different parent.  This would silently corrupt the parent map and
+break any DFS-like guarantee that does survive.
+
+\paragraph{Effect of the bag's data structure.}
+The behaviour of the algorithm depends crucially on what
+$\mathcal{B}$ is:
+
+\begin{itemize}
+  \item \textbf{Stack (LIFO).}  The newest discovered vertex sits on
+        top, so it is explored before older vertices deeper in the
+        stack.  This mirrors the recursion structure of sequential DFS
+        and produces a \emph{depth-biased} exploration.  It is the
+        closest the work-pool scheme comes to true DFS.
+  \item \textbf{Queue (FIFO).}  Older discovered vertices are
+        processed before newer ones, which is exactly BFS-like
+        layering.  The exploration is breadth-first.
+  \item \textbf{Unordered bag.}  No bias either way.  The problem
+        reduces to general graph reachability: the spanning tree
+        produced is correct, but neither depth- nor breadth-biased.
+\end{itemize}
+
+\begin{ppnote}
+Even with a stack, the work-pool algorithm need not produce a valid
+DFS tree along every path.  Because multiple threads operate
+simultaneously, the order in which vertices are removed from the stack
+is interleaved across threads, and the global discovery order is no
+longer a depth-first traversal.  At best, individual paths look DFS-like.
+For applications that genuinely need the DFS tree property, the
+divide-and-conquer scheme of the next subsection is required.
+\end{ppnote}
+
+%------------------------------------------------------------------
+\subsection{Divide-and-Conquer Parallel DFS}
+\label{sec:dnc-dfs}
+%------------------------------------------------------------------
+
+If the goal is genuinely to produce a DFS tree (and not just a
+spanning tree), we need a different scheme.  The divide-and-conquer
+approach proceeds as follows.
+
+\paragraph{High-level steps.}
+\begin{enumerate}
+  \item Identify a path $P$ that acts as the \emph{spine} of the DFS
+        tree.
+  \item Find the connected components of $G \setminus P$ that hang off
+        the spine.
+  \item Assign each such component to an attachment vertex on the
+        spine.
+  \item Recursively compute DFS trees of the components in parallel.
+  \item Merge the recursive DFS trees into one global DFS tree.
+  \item Verify the DFS property; if violated, perform local
+        root-cause analysis and pick an alternate choice from the
+        problem point.
+\end{enumerate}
+
+The divide-and-conquer scheme is a heuristic.  Most of the time
+(``99\% in practice'') the resulting tree is a valid DFS tree, but
+not always.  If the application strictly requires DFS, step~6 (the
+verification + alternate choice loop) is non-negotiable.
+
+\begin{ppnote}
+Studying parallel DFS is unusually instructive because identifying the
+spine itself reduces to several other parallel graph problems.  In
+particular, step~1 needs a spanning tree of $G$; computing a spanning
+tree in parallel introduces parallel sorting, parallel scan, and
+parallel union--find.  The remainder of this chapter develops those
+ingredients.
+\end{ppnote}
+
+%==================================================================
+\section{Parallel Kruskal's Algorithm}
+\label{sec:parallel-kruskal}
+%==================================================================
+
+To identify a spine for the divide-and-conquer DFS, we first compute a
+spanning tree of $G$.  Two classical algorithms come to mind: Prim's
+and Kruskal's~\cite{kruskal1956}.
+
+\begin{ppnote}
+Prim's algorithm grows the spanning tree from a single vertex by
+repeatedly adding the minimum-weight edge that leaves the current
+tree.  This is essentially a transitive-closure-style expansion of an
+adjacency matrix.  Transitive closures are not naturally parallelisable
+in the way Prim needs them, and so Prim is not a good starting point
+for a parallel algorithm.  Kruskal's, by contrast, is.
+\end{ppnote}
+
+The parallel version of Kruskal's algorithm has four phases:
+\begin{enumerate}
+  \item Parallel-sort the edges by weight.
+  \item Run \ppterm{Bor\r{u}vka rounds}: each component picks its
+        minimum-weight outgoing edge in parallel.
+  \item Deduplicate the chosen edges (two components may have picked
+        the same edge) using a parallel scan.
+  \item Contract components into super-vertices using a parallel
+        union--find with pointer jumping; then connect components by
+        a min cross-component edge selection.
+\end{enumerate}
+
+%------------------------------------------------------------------
+\subsection{Step 1: Parallel Sort of Edges by Weight}
+%------------------------------------------------------------------
+
+We could use the parallel radix sort developed in the previous
+chapter.  The lecture instead develops parallel \emph{merge} sort
+because it teaches a separate set of useful ideas.
+
+\paragraph{Outer scheme.}
+With $p$ processors and an edge set $E$:
+\begin{enumerate}
+  \item Split $E$ into $p$ chunks of size $E/p$.
+  \item Each processor sorts its chunk \emph{sequentially} using
+        ordinary merge sort.  This costs
+        $O((E/p) \log (E/p))$ per processor.
+  \item Combine the sorted chunks via a \emph{parallel merge}
+        reduction.  The reduction tree has $\log p$ levels.
+\end{enumerate}
+
+\begin{ppexample}
+Suppose $E = [38, 27, 43, 3, 9, 82, 10, 19]$ and we have two threads.
+\[
+  T_1: [38,27,43,3] \;\longrightarrow\; [3,27,38,43]
+\]
+\[
+  T_2: [9,82,10,19] \;\longrightarrow\; [9,10,19,82]
+\]
+The parallel merge then combines $[3,27,38,43]$ and $[9,10,19,82]$.
+\end{ppexample}
+
+\paragraph{Parallel merge of two sorted arrays $A$ and $B$.}
+\begin{enumerate}
+  \item Pick the median of the larger array, say $A[\mathit{mid}]$.
+  \item Use binary search to find the index $k$ in $B$ such that
+        $A[\mathit{mid}]$ would fit between $B[k-1]$ and $B[k]$.
+  \item This produces four segments: $A_{\text{left}} = A[1..\mathit{mid}{-}1]$,
+        $A_{\text{right}} = A[\mathit{mid}{+}1..]$, $B_{\text{left}} = B[1..k{-}1]$,
+        $B_{\text{right}} = B[k..]$.
+  \item Concurrently:
+        \begin{itemize}
+          \item Processor 1 recursively merges $A_{\text{left}}$ with
+                $B_{\text{left}}$.
+          \item Processor 2 recursively merges $A_{\text{right}}$ with
+                $B_{\text{right}}$.
+        \end{itemize}
+\end{enumerate}
+
+The binary search step at line~2 can itself be parallelised when the
+subarrays are large.  This is an instance of \ppterm{dynamic
+parallelism}: as we recurse, we keep creating new tasks that the
+runtime can assign to additional processors.
+
+\paragraph{Complexity recurrence.}
+The lecture states the recurrence
+\[
+  T(n) \;=\; T\!\left(\tfrac{3n}{4}\right) \;+\; O(\log n).
+\]
+The factor $3n/4$ arises because, in the worst case, the median split
+distributes the elements as $\tfrac{n}{2}$ from one array plus
+between $\tfrac{n}{4}$ and $\tfrac{3n}{4}$ from the other.  So the
+larger of the two recursive subproblems has at most $3n/4$ elements.
+By the Master Theorem (case 2 with $a = 1$, $b = 4/3$, $f(n) = \log n$),
+the closed form is
+\[
+  T(n) \;=\; O(\log^2 n).
+\]
+A formal derivation is left as an exercise.
+\begin{ppexample}
+\textbf{Dry run of parallel merge sort with 16 numbers.}
+Take
+\[
+A = [38, 27, 43, 3,\; 9, 82, 10, 19,\; 71, 56, 12, 44,\; 5, 99, 21, 60].
+\]
+Split into 4 chunks of size 4:
+
+\[
+\begin{aligned}
+C_1 &= [38,27,43,3] \\
+C_2 &= [9,82,10,19] \\
+C_3 &= [71,56,12,44] \\
+C_4 &= [5,99,21,60]
+\end{aligned}
+\]
+
+Each chunk is sorted locally in parallel:
+
+\[
+\begin{aligned}
+C_1' &= [3,27,38,43] \\
+C_2' &= [9,10,19,82] \\
+C_3' &= [12,44,56,71] \\
+C_4' &= [5,21,60,99]
+\end{aligned}
+\]
+
+Now merge in pairs:
+
+\[
+M_1 = \textsc{ParallelMerge}(C_1', C_2') = [3,9,10,19,27,38,43,82]
+\]
+\[
+M_2 = \textsc{ParallelMerge}(C_3', C_4') = [5,12,21,44,56,60,71,99]
+\]
+
+Final merge:
+
+\[
+\begin{aligned}
+\textsc{ParallelMerge}(M_1, M_2)
+&= [3,5,9,10,12,19,21,27,38,43,44,\\
+&\quad 56,60,71,82,99].
+\end{aligned}
+\]
+
+So the 16 numbers are sorted by 4-way chunk sorting followed by parallel pairwise merges.
+\end{ppexample}
+%------------------------------------------------------------------
+\subsection{Step 2: Bor\r{u}vka Rounds}
+%------------------------------------------------------------------
+
+After sorting the edges, we still do not have a spanning tree---we
+just have a sorted edge list.  The next phase is the parallel core of
+Kruskal's, sometimes also called Bor\r{u}vka's algorithm~\cite{boruvka1926} in its own right.
+
+\paragraph{Initial setup.}
+Each vertex starts as its own component.  Each component is given to
+one processor.  In each Bor\r{u}vka round:
+
+\begin{enumerate}
+  \item Every component identifies its minimum-weight \emph{outgoing}
+        edge (the minimum-weight edge with one endpoint inside the
+        component and the other outside).
+  \item The selected edges are deduplicated (Step~3 below).
+  \item The components joined by the surviving edges are contracted
+        into super-vertices.
+  \item Repeat until only one component remains.
+\end{enumerate}
+
+\begin{ppexample}
+Consider the graph (Figure adapted from the lecture)
+$V = \{A, B, C, D, E, F\}$ with edges and weights
+\[
+  (A,C){=}2,\; (A,B){=}4,\; (C,B){=}5,\; (B,D){=}6,\; (B,E){=}3,\
+\]
+\[
+   (C,D){=}8,\; (C,E){=}10,\;(D,F){=}7,\; (E,F){=}9.
+\]
+Each vertex is one component; with six processors $P_1, \ldots, P_6$:
+
+\begin{center}
+\small
+\begin{tabular}{@{}clp{4.8cm}l@{}}
+\toprule
+Proc.\ & Comp.\ & Sorted incident edges & Min outgoing edge \\
+\midrule
+$P_1$ & $A$ & $(A,C){=}2$, $(A,B){=}4$ & $(A,C),\; w{=}2$ \\
+$P_2$ & $B$ & $(B,E){=}3$, $(A,B){=}4$, $(B,C){=}5$, $(B,D){=}6$ & $(B,E),\; w{=}3$ \\
+$P_3$ & $C$ & $(A,C){=}2$, $(B,C){=}5$, $(C,D){=}8$, $(C,E){=}10$ & $(A,C),\; w{=}2$ \\
+$P_4$ & $D$ & $(B,D){=}6$, $(D,F){=}7$, $(C,D){=}8$ & $(B,D),\; w{=}6$ \\
+$P_5$ & $E$ & $(B,E){=}3$, $(E,F){=}9$, $(C,E){=}10$ & $(B,E),\; w{=}3$ \\
+$P_6$ & $F$ & $(D,F){=}7$, $(E,F){=}9$ & $(D,F),\; w{=}7$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\[
+\begin{aligned}
+\text{The selected edges are } \{(A,C), (B,E), (A,C), (B,D), (B,E), \\
+(D,F)\}; \text{ the duplicates } (A,C) \text{ and } (B,E) \text{ each appear twice.}
+\end{aligned}
+\]
+\end{ppexample}
+
+%------------------------------------------------------------------
+\subsection{Step 3: Deduplication via Parallel Scan}
+%------------------------------------------------------------------
+
+At scale, the picked-edge list is large and the duplicate count is
+non-trivial.  We must remove duplicates in parallel.
+
+\paragraph{Parallel deduplication recipe.}
+\begin{enumerate}
+  \item Construct a unique label for each edge, e.g.\ a lexicographic
+        ordering of $(\min(u,v), \max(u,v), w)$.
+  \item \emph{Parallel-sort} the picked-edge list by this label.
+  \item Identical edges now sit adjacent to each other.
+  \item Apply a \emph{parallel exclusive prefix scan}~\cite{blelloch1996}: each position
+        compares to its predecessor and is marked $1$ if it differs
+        (a unique entry) or $0$ if it matches (a duplicate to be
+        dropped).  The scan output is then used as a compaction
+        index, just as in the parallel filter from earlier in the
+        course.
+\end{enumerate}
+
+In our running example, after deduplication we are left with
+\[
+  \{(A,C){=}2,\; (B,E){=}3,\; (B,D){=}6,\; (D,F){=}7\}.
+\]
+
+%------------------------------------------------------------------
+\subsection{Step 4: Parallel Union--Find with Pointer Jumping}
+%------------------------------------------------------------------
+
+We now must contract the components joined by the four surviving
+edges, and then connect the resulting super-vertices with a
+minimum-weight cross-component edge.
+
+\paragraph{Pointer jumping primer.}
+Each vertex stores a parent pointer; the root of a tree points to
+itself.  \ppterm{Pointer jumping} is the parallel update
+\[
+  \mathit{parent}[v] \;\leftarrow\; \mathit{parent}[\mathit{parent}[v]]
+\]
+applied uniformly to all $v$ for $\log n$ rounds.  After $\log n$
+rounds, every $v$ points directly at the root of its tree (path
+compression for free).  This is the parallel analogue of the
+classical union--find with path compression~\cite{jaja1992}.
+
+\paragraph{Round 1 of union--find on the running example.}
+Each processor handles one of the four edges and calls
+$\textsc{Union}(u, v)$.  Processing $(A,C), (B,E), (B,D), (D,F)$
+yields two flat trees:
+\begin{itemize}
+  \item $\{A, C\}$ rooted at, say, $A$.
+  \item $\{B, D, E, F\}$ rooted at $B$, with $F$ jumping directly to
+        $B$ via path compression on the $(D,F)$ edge.
+\end{itemize}
+
+\paragraph{Connecting the components.}
+We are left with two components and need to add a minimum-weight
+cross-component edge.  This is again a parallel computation:
+
+\begin{enumerate}
+  \item For every edge $(u,v)$ in the original graph, each processor
+        checks in $O(1)$ whether it crosses components, using the
+        primitive
+        \[
+          \textsc{find}(u) \neq \textsc{find}(v).
+        \]
+        Recall that \textsc{find} returns the root of the component
+        containing its argument; this is $O(1)$ amortised after
+        pointer jumping.
+  \item Across all cross-component edges, perform a \ppterm{parallel
+        min-reduction} on edge weight to pick the cheapest one.
+  \item Add that edge to the spanning tree and re-run union--find if
+        more than two components remain.
+\end{enumerate}
+
+\paragraph{Resulting MST on the running example.}
+For the lecture graph the minimum spanning tree consists of
+\[
+  (A,C),\; (A,B),\; (B,E),\; (B,D),\; (D,F).
+\]
+(The cross-component edge $(A,B)$ with $w = 4$ is what connects the
+two components produced by Round~1.)
+
+\begin{ppnote}
+This is only step~1 of the parallel DFS pipeline.  The remaining
+steps---identifying the spine \emph{within} the spanning tree,
+decomposing components off the spine, recursing, and merging---are
+deferred to the next lecture.  But you should already see how the
+``small'' problem of parallel DFS builds on top of half a dozen
+other parallel primitives: parallel sort, parallel scan, Bor\r{u}vka
+rounds, and parallel union--find with pointer jumping~\cite{bader2005}.
+\end{ppnote}
+
+%==================================================================
+\section*{Key Takeaways}
+\addcontentsline{toc}{section}{Key Takeaways}
+%==================================================================
+
+\begin{ppnote}
+\begin{itemize}
+  \item \textbf{BFS is naturally parallelisable} because all vertices in
+        a frontier are independent.  Parallel BFS expands one frontier
+        per round, with parallel for-loops over frontier vertices and
+        their neighbours.
+  \item \textbf{CAS is the coordination primitive} for the next-frontier
+        update: it ensures that each newly discovered vertex is added
+        exactly once, even when discovered concurrently by multiple
+        threads.
+  \item \textbf{Parallel BFS complexity} is $O((V+E)/p)$ under perfect
+        balance, but the practical bound is
+        $\sum_d O(W_d/p) + O(\text{sync})$, and the right proxy for
+        achievable parallelism is the graph diameter, not just $|V|$
+        and $|E|$.
+  \item \textbf{Load imbalance} in BFS is fought with work-stealing
+        queues, an idea due to Leiserson and embodied in
+        \textsc{Cilk} (later Intel TBB).
+  \item \textbf{DFS is hard to parallelise} because it imposes an
+        order on vertex discovery.  Naive parallel exploration produces
+        a spanning tree, not a DFS tree.
+  \item \textbf{Work-pool depth-biased search} maintains a shared bag
+        of frontier vertices.  A stack gives depth-biased exploration,
+        a queue gives BFS-like layering, an unordered bag gives plain
+        reachability.
+  \item \textbf{Divide-and-conquer parallel DFS} computes a spine
+        path, decomposes off-spine components, recursively builds
+        DFS trees on each component, and merges; verification is
+        required if a strict DFS tree is needed.
+  \item \textbf{Parallel Kruskal's} = parallel merge sort + Bor\r{u}vka
+        rounds + parallel-scan deduplication + parallel union--find
+        with pointer jumping.
+  \item \textbf{Parallel merge} of two sorted arrays uses median
+        selection plus binary search to recurse on four pieces; its
+        recurrence is $T(n) = T(3n/4) + O(\log n)$.
+  \item \textbf{Pointer jumping} achieves path compression in
+        $O(\log n)$ parallel rounds, making \textsc{find} effectively
+        $O(1)$ for downstream cross-component edge tests.
+\end{itemize}
+\end{ppnote}
+
+%==================================================================
+\section{Exercises}
+%==================================================================
+
+\begin{ppexercises}
+
+\ppexercise{%
+\textbf{Why CAS?}  In the parallel BFS skeleton, replace the line
+\texttt{if CAS(\&visited[v], false, true)} with the unsynchronised
+test \texttt{if (!visited[v]) \{ visited[v] = true; \ldots \}}.
+Construct a small graph (at most 6 vertices) and a thread interleaving
+that demonstrates a concrete bug introduced by removing the CAS.
+
+\textbf{Solution.}
+Take $G$ on vertices $\{s, u, u', v\}$ with edges $\{(s,u), (s,u'),
+(u,v), (u',v)\}$.  Start BFS from $s$.  After level 0, the frontier is
+$\{u, u'\}$, owned by Threads 1 and 2 respectively.  Both threads
+inspect $v$ as a neighbour:
+\begin{enumerate}
+  \item Thread 1 reads \texttt{visited[v]} = \texttt{false}.
+  \item Thread 2 reads \texttt{visited[v]} = \texttt{false} (before
+        Thread 1's write).
+  \item Thread 1 writes \texttt{visited[v]} = \texttt{true} and
+        inserts $v$ into the next frontier with parent $u$.
+  \item Thread 2 writes \texttt{visited[v]} = \texttt{true} and
+        inserts $v$ into the next frontier with parent $u'$.
+\end{enumerate}
+The vertex $v$ is now in the next frontier twice, with two different
+parents.  At level 2, $v$'s neighbours will be expanded twice,
+inflating both work and the next frontier.  CAS prevents step~4 from
+succeeding because the value of \texttt{visited[v]} no longer matches
+the expected \texttt{false}.
+}
+\begin{ppexercise}{%
+\textbf{Exercise from the lecture.}
+Write an OpenMP implementation of level-synchronous parallel BFS.
+Use an atomic test-and-set (or CAS) on \texttt{visited[v]} to prevent duplicate insertions into the next frontier.
+You can try an MPI version as well.
+
+\textbf{Solution.}
+A simple OpenMP version is:
+
+\[
+\begin{aligned}
+&\texttt{frontier = \{source\};}\\
+&\texttt{visited[source] = true;}\\
+&\texttt{dist[source] = 0;}\\
+&\texttt{level = 0;}\\
+&\texttt{while (!frontier.empty()) \{}\\
+&\qquad \texttt{next\_frontier.clear();}\\
+&\qquad \texttt{\#pragma omp parallel}\\
+&\qquad \texttt{\{}\\
+&\qquad\qquad \texttt{std::vector<int> local\_next;}\\
+&\qquad\qquad \texttt{\#pragma omp for schedule(dynamic,1) nowait}\\
+&\qquad\qquad \texttt{for (int i = 0; i < frontier.size(); ++i) \{}\\
+&\qquad\qquad\qquad \texttt{int u = frontier[i];}\\
+&\qquad\qquad\qquad \texttt{for (int v : adj[u]) \{}\\
+&\qquad\qquad\qquad\qquad \texttt{bool expected = false;}\\
+&\qquad\qquad\qquad\qquad \texttt{if (visited[v].compare\_exchange\_strong(}\allowbreak\\
+&\qquad\qquad\qquad\qquad\qquad \texttt{expected, true)) \{}
+&\qquad\qquad\qquad\qquad\qquad \texttt{dist[v] = level + 1;}\\
+&\qquad\qquad\qquad\qquad\qquad \texttt{local\_next.push\_back(v);}\\
+&\qquad\qquad\qquad\qquad \texttt{\}}\\
+&\qquad\qquad\qquad \texttt{\}}\\
+&\qquad\qquad \texttt{\}}\\
+&\qquad\qquad \texttt{\#pragma omp critical}\\
+&\qquad\qquad \texttt{next\_frontier.insert(next\_frontier.end(),}\\
+&\qquad\qquad \texttt{local\_next.begin(), local\_next.end());}
+&\qquad \texttt{\}}\\
+&\qquad \texttt{frontier.swap(next\_frontier);}\\
+&\qquad \texttt{++level;}\\
+&\texttt{\}}
+\end{aligned}
+\]
+
+The key idea is that only one thread can flip \texttt{visited[v]} from false to true, so every vertex enters the next frontier exactly once. You can try MPI as well by distributing frontier vertices across ranks and using message passing for discovered neighbors.
+}
+\end{ppexercise}
+\ppexercise{%
+\textbf{Diameter and parallelism.}  Two graphs $G_1$ and $G_2$ both
+have $|V| = 10^6$ and $|E| = 5 \times 10^6$.  $G_1$ is a long path-like
+graph with diameter $\approx 10^4$; $G_2$ is a small-world graph with
+diameter $\approx 20$.  Assume work is perfectly balanced within each
+level and that synchronisation cost per level is a constant
+$c = 1\,\mu$s.
+\begin{enumerate}[label=(\alph*)]
+  \item Write the parallel BFS time on $p$ processors as a function of
+        diameter $D$.
+  \item Estimate $T_p$ for $G_1$ and $G_2$ on $p = 64$ processors.
+  \item Which graph benefits more from doubling $p$ to $128$?
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item $T_p \approx \tau \cdot (V + E)/p + D \cdot c$, where $\tau$
+        is the per-operation time.  Computation scales with $p$;
+        the diameter term does not.
+  \item Assume $\tau = 1$~ns.  Computation per processor is
+        $\tau (V+E)/p = 10^{-9} \cdot 6\times 10^6 / 64
+        \approx 9.4 \times 10^{-5}$~s $= 94\,\mu$s.
+        Sync floor: $G_1$ contributes $D_1 \cdot c
+        = 10^4 \cdot 10^{-6} = 10$~ms; $G_2$ contributes
+        $D_2 \cdot c = 20\,\mu$s.
+        So $T_{64}(G_1) \approx 94\,\mu\text{s} + 10\,\text{ms}
+        \approx 10.1$~ms (sync-dominated), while
+        $T_{64}(G_2) \approx 94\,\mu\text{s} + 20\,\mu\text{s}
+        \approx 114\,\mu$s (compute-dominated).
+  \item $G_2$.  Its sync cost was already negligible, so doubling $p$
+        nearly halves the runtime.  $G_1$ is dominated by the
+        $D \cdot c = 10$~ms sync floor; that floor does not move when
+        $p$ doubles, so $G_1$'s speedup saturates.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Bag choice in work-pool search.}  The work-pool parallel
+search algorithm uses a bag $\mathcal{B}$ to hold frontier vertices.
+For each of (a)~stack, (b)~queue, (c)~unordered bag, describe
+the discovery order produced and identify a graph algorithm whose
+correctness depends on that ordering.
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Stack (LIFO).}  Discovery is depth-biased; each path
+        is followed greedily before backtracking.  Useful for
+        approximate DFS-based heuristics: cycle detection, articulation
+        points, and SAT-style search where one wants to commit to
+        a partial assignment as long as possible.
+  \item \textbf{Queue (FIFO).}  Discovery proceeds in BFS layers;
+        equivalent to the level-synchronous parallel BFS of
+        Section~2.  Useful for shortest-path-in-edges, peer-to-peer
+        lookups, and crawl-style traversals.
+  \item \textbf{Unordered bag.}  No bias either way.  Useful for
+        connected-components / graph-reachability problems, where
+        one only needs to know which vertices are reachable, not in
+        which order.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Parallel merge sort.}
+Write pseudocode for parallel merge sort using:
+\begin{itemize}
+  \item sequential sorting of chunks,
+  \item parallel merge of two sorted arrays, and
+  \item parallel binary search to find the split point.
+\end{itemize}
+
+\textbf{Solution.}
+\[
+\begin{aligned}
+&\textsc{ParallelMergeSort}(A):\\
+&\qquad \text{if } |A| \le 1 \text{ return } A\\
+&\qquad \text{split } A \text{ into } p \text{ chunks}\\
+&\qquad \text{parallel for each chunk } C_i:\\
+&\qquad\qquad \text{sort } C_i \text{ sequentially using merge sort}\\
+&\qquad \text{return } \textsc{ParallelMergeAll}(C_1, C_2, \dots, C_p)
+\end{aligned}
+\]
+
+\[
+\begin{aligned}
+&\textsc{ParallelMerge}(X, Y):\\
+&\qquad \text{if } |X| > |Y| \text{ swap } X \text{ and } Y\\
+&\qquad \text{if } |X| = 0 \text{ return } Y\\
+&\qquad m \leftarrow \lfloor |X|/2 \rfloor\\
+&\qquad k \leftarrow \textsc{BinarySearch}(Y, X[m])\\
+&\qquad L \leftarrow \textsc{ParallelMerge}(X[0..m-1],\, Y[0..k-1])\\
+&\qquad R \leftarrow \textsc{ParallelMerge}(X[m+1..],\, Y[k..])\\
+&\qquad \text{return } L \,\Vert\, X[m] \,\Vert\, R
+\end{aligned}
+\]
+
+\[
+\begin{aligned}
+&\textsc{BinarySearch}(Y, x, l, r):\\
+&\qquad \textbf{while } l \le r \textbf{ do}\\
+&\qquad\qquad m = \left\lfloor \frac{l + r}{2} \right\rfloor\\
+&\qquad\qquad \textbf{if } Y[m] = x \textbf{ then return } m\\
+&\qquad\qquad \textbf{if } Y[m] < x \textbf{ then } l = m + 1\\
+&\qquad\qquad \textbf{else } r = m - 1\\
+&\qquad \textbf{return } l \quad \text{// insertion position}
+\end{aligned}
+\]
+
+
+This gives a parallel merge sort built from local sorting plus recursive parallel merging.
+}
+\ppexercise{%
+\textbf{Parallel merge complexity.}  The parallel merge recurrence is
+\[
+  T(n) \;=\; T\!\left(\tfrac{3n}{4}\right) \;+\; O(\log n).
+\]
+\begin{enumerate}[label=(\alph*)]
+  \item Justify the $3n/4$ factor.
+  \item Solve the recurrence in closed form using the Master Theorem.
+  \item How does this compare to the $O(\log n)$ depth of an EREW
+        PRAM merge using $n$ processors?
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item Pick the median of the larger array (size $\geq n/2$).  After
+        binary search in the other array, the four pieces have sizes
+        $|A_{\mathrm{left}}|, |A_{\mathrm{right}}|, |B_{\mathrm{left}}|,
+        |B_{\mathrm{right}}|$ with
+        $|A_{\mathrm{left}}| = |A_{\mathrm{right}}| \leq n/4$ each, but
+        the corresponding $B$ side can be as large as $n/2$.  The
+        worst-case recursive subproblem has total size at most
+        $n/4 + n/2 = 3n/4$.
+  \item With $a = 1$, $b = 4/3$, $f(n) = \log n$:
+        $\log_b a = 0$, so the recurrence is in Master-Theorem case~2,
+        and $T(n) = O(\log n \cdot \log_{4/3} n) = O(\log^2 n)$.
+  \item EREW PRAM merge with $n$ processors achieves $O(\log n)$
+        depth.  The recursive scheme is one logarithmic factor worse
+        because it is doing the binary search on each level rather
+        than performing all merges in lockstep.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Bor\r{u}vka rounds count.}  Show that parallel Kruskal's
+algorithm terminates in $O(\log V)$ Bor\r{u}vka rounds.
+
+\textbf{Solution.}
+At the start of each Bor\r{u}vka round, every component has at least
+one outgoing edge (assuming $G$ is connected).  When a component picks
+its minimum outgoing edge, that edge merges the component with at
+least one other.  Even after deduplication, every surviving component
+merges with at least one neighbour.  Thus the number of components
+\emph{at most halves} after each round.  Starting with $|V|$
+components and ending with 1 takes at most $\lceil \log_2 |V| \rceil$
+rounds.
+}
+
+\ppexercise{%
+\textbf{Pointer jumping correctness.}  Let $T$ be a rooted tree
+encoded as an array $\mathit{parent}[\,]$, where the root points to
+itself.  Define the parallel update
+\[
+  \mathit{parent}[v] \;\leftarrow\; \mathit{parent}[\mathit{parent}[v]]
+  \quad \text{for all } v \text{ in parallel.}
+\]
+\begin{enumerate}[label=(\alph*)]
+  \item After how many rounds does every $v$ point to the root?
+  \item Why is the in-place parallel update safe (no race conditions
+        in the value being written) given that we read
+        $\mathit{parent}[\mathit{parent}[v]]$ before writing
+        $\mathit{parent}[v]$?
+\end{enumerate}
+
+\textbf{Solution.}
+\begin{enumerate}[label=(\alph*)]
+  \item Each round doubles the depth-progress: after round $k$, every
+        $v$ points to its $2^k$-th ancestor (or the root, if it
+        is shallower).  After $\lceil \log_2 h \rceil$ rounds, where
+        $h$ is the height of the tree, every $v$ points to the root.
+        For $|V| = n$, $h \leq n$, so $O(\log n)$ rounds suffice.
+  \item Standard pointer-jumping implementations use a separate
+        \emph{old} and \emph{new} parent array (a double-buffer).
+        Reads come from the old array, writes go to the new array.
+        This is the EREW PRAM convention.  In a single-array
+        in-place implementation, races are technically benign in
+        the limit (every write moves $v$ closer to the root) but
+        the round count guarantee weakens; the textbook construction
+        uses double-buffering for clean correctness.
+\end{enumerate}
+}
+
+\ppexercise{%
+\textbf{Why Prim does not parallelise.}  Prim's algorithm grows the
+spanning tree from a single vertex by repeatedly adding the
+minimum-weight edge that has exactly one endpoint inside the current
+tree.  Identify the structural feature of Prim that prevents it from
+parallelising in the way Kruskal's/Bor\r{u}vka's does.
+
+\textbf{Solution.}
+Prim's growth step depends on \emph{the current tree} as a single
+unit.  At each step, the algorithm needs the global minimum edge on
+the cut between the tree and the rest of the graph.  The next edge
+chosen depends on the previous one (it changes the cut), so the
+algorithm is intrinsically sequential.
+
+Bor\r{u}vka does not have this dependency: every \emph{component} can
+choose its minimum outgoing edge independently of the others, in
+parallel.  The duplication that arises is handled by deduplication
+(parallel scan), and the contraction is handled by parallel
+union--find.  The key structural difference is many growing
+components vs.~one growing tree.
+}
+
+\ppexercise{%
+\[
+\begin{aligned}
+V &= \{1,2,3,4,5\}, \\
+E &= \{(1,2,1),\; (2,3,4),\; (1,3,2),\\
+&\qquad (3,4,3),\; (4,5,5),\; (2,5,6)\}.
+\end{aligned}
+\]
+Show the components, picked edges, deduplicated edges, and the final
+MST after each Bor\r{u}vka round.
+
+\textbf{Solution.}
+
+\textbf{Round 1.}
+
+Initial components:
+\[
+\{1\},\; \{2\},\; \{3\},\; \{4\},\; \{5\}.
+\]
+
+Each component picks its minimum outgoing edge:
+
+\begin{center}
+\begin{tabular}{@{}cl@{}}
+\toprule
+Component & Min outgoing edge \\
+\midrule
+$\{1\}$ & $(1,2)$ with $w=1$ \\
+$\{2\}$ & $(1,2)$ with $w=1$ \\
+$\{3\}$ & $(1,3)$ with $w=2$ \\
+$\{4\}$ & $(3,4)$ with $w=3$ \\
+$\{5\}$ & $(4,5)$ with $w=5$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Picked edges (with duplicates):}
+\[
+\{(1,2), (1,2), (1,3), (3,4), (4,5)\}.
+\]
+
+\textbf{After deduplication:}
+\[
+\{(1,2), (1,3), (3,4), (4,5)\}.
+\]
+
+\textbf{Union--Find (component merging):}
+\begin{itemize}
+  \item $(1,2)$ merges $\{1\}$ and $\{2\}$ $\rightarrow \{1,2\}$
+  \item $(1,3)$ merges $\{1,2\}$ and $\{3\}$ $\rightarrow \{1,2,3\}$
+  \item $(3,4)$ merges $\{1,2,3\}$ and $\{4\}$ $\rightarrow \{1,2,3,4\}$
+  \item $(4,5)$ merges $\{1,2,3,4\}$ and $\{5\}$ $\rightarrow \{1,2,3,4,5\}$
+\end{itemize}
+
+After this round, all vertices belong to a single component:
+\[
+\{1,2,3,4,5\}.
+\]
+
+\textbf{Round 2.}
+
+Only one component remains, so no outgoing edges exist.
+The algorithm terminates.
+
+\textbf{Final MST edges:}
+\[
+\{(1,2), (1,3), (3,4), (4,5)\}.
+\]
+
+\textbf{Total weight:}
+\[
+1 + 2 + 3 + 5 = 11.
+\]
+
+\textbf{Note:}
+The edges $(2,3)$ and $(2,5)$ are not included because they would form cycles and are not minimum among competing edges.
+}
+
+\end{ppexercises}
+
+%==================================================================
+%==================================================================
+%==================================================================
+\section*{References}
+\addcontentsline{toc}{section}{References}
+%==================================================================
+
+The following sources were used in preparing this chapter.
+
+\begin{itemize}
+  \item A.~Grama, G.~Karypis, V.~Kumar, and A.~Gupta,
+        \emph{Introduction to Parallel Computing}, 2nd~ed.
+        Addison-Wesley, 2003.~\cite{grama2003}
+  \item P.~Pacheco, \emph{An Introduction to Parallel Programming}.
+        Morgan Kaufmann, 2011.~\cite{pacheco2011}
+  \item G.~E.~Blelloch, ``Programming Parallel Algorithms,''
+        \emph{Communications of the ACM}, vol.~39, no.~3,
+        pp.~85--97, 1996.~\cite{blelloch1996}
+  \item R.~D.~Blumofe and C.~E.~Leiserson, ``Scheduling Multithreaded
+        Computations by Work Stealing,'' \emph{Journal of the ACM},
+        vol.~46, no.~5, pp.~720--748, 1999.~\cite{blumofe1999}
+  \item M.~Frigo, C.~E.~Leiserson, and K.~H.~Randall, ``The
+        Implementation of the Cilk-5 Multithreaded Language,''
+        \emph{Proceedings of the ACM SIGPLAN Conference on
+        Programming Language Design and Implementation (PLDI)},
+        pp.~212--223, 1998.~\cite{frigo1998cilk}
+  \item S.~Beamer, K.~Asanovi\'c, and D.~Patterson,
+        ``Direction-Optimizing Breadth-First Search,''
+        \emph{Proceedings of the International Conference on High
+        Performance Computing, Networking, Storage and Analysis (SC)},
+        2012.~\cite{beamer2012}
+  \item O.~Bor\r{u}vka, ``O jist\'em probl\'emu minim\'aln\'\i m''
+        (``On a certain minimal problem''), \emph{Pr\'ace Moravsk\'e
+        P\v{r}\'\i rodov\v{e}deck\'e Spole\v{c}nosti}, vol.~3,
+        pp.~37--58, 1926.~\cite{boruvka1926}
+  \item J.~B.~Kruskal, ``On the shortest spanning subtree of a graph
+        and the traveling salesman problem,'' \emph{Proceedings of the
+        American Mathematical Society}, vol.~7, no.~1, pp.~48--50,
+        1956.~\cite{kruskal1956}
+  \item D.~A.~Bader and G.~Cong, ``A Fast, Parallel Spanning Tree
+        Algorithm for Symmetric Multiprocessors,'' \emph{Journal of
+        Parallel and Distributed Computing}, vol.~65, no.~9,
+        pp.~994--1006, 2005.~\cite{bader2005}
+  \item J.~J\'aJ\'a, \emph{An Introduction to Parallel Algorithms}.
+        Addison-Wesley, 1992.~\cite{jaja1992}
+\end{itemize}
+%==================================================================
+\section*{Contributor}
+\addcontentsline{toc}{section}{Contributor}
+%==================================================================
+
+\begin{ppnote}
+Transcribed by \textbf{Himanshi Bhandari}, Entry No.\ \textbf{2023CS10888}.
+\end{ppnote}
