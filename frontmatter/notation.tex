@@ -8,3 +8,109 @@
 \begin{ppkey}
 Always separate \ppterm{algorithmic parallelism} from \ppterm{implementation overheads}.
 \end{ppkey}
+
+\begin{ppdefn}
+\ppterm{Vertex Set ($V$)}:
+The set of all vertices (nodes) in a graph.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Edge Set ($E$)}:
+The set of all edges in a graph. Each edge may be represented as $(u,v)$ or $(u,v,w)$ for weighted graphs.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Degree ($\deg(u)$)}:
+The number of neighbours of a vertex $u$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Frontier}:
+The set of vertices at the current BFS level being processed in parallel.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Visited Array}:
+A boolean array where $\texttt{visited}[v]$ indicates whether vertex $v$ has been discovered.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Distance ($d[v]$)}:
+The shortest-path distance from the source vertex to vertex $v$ in BFS.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Compare-and-Swap (CAS)}:
+An atomic operation $\textsf{CAS}(\&x, old, new)$ that updates $x$ to $new$ only if its current value equals $old$.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Work ($W$)}:
+Total number of operations performed by a parallel algorithm.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Span / Critical Path ($T_\infty$)}:
+Length of the longest chain of dependent operations in a parallel computation; equivalently, the running time on infinitely many processors.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Level Work ($W_d$)}:
+Total work at BFS level $d$, defined as
+\[
+W_d = \sum_{u \in \text{frontier}_d} \deg(u).
+\]
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{BFS Levels ($k$)}:
+The number of levels (rounds) in a level-synchronous BFS from a chosen source --- equivalently, the eccentricity of the source.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Graph Diameter}:
+The maximum shortest-path distance over all pairs of vertices, $\max_{u,v} d(u,v)$.  Bounds the number of BFS levels for any source.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{DFS Tree}:
+A spanning tree produced by a depth-first traversal; every non-tree edge of $G$ joins a vertex to one of its ancestors or descendants in the tree.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Spanning Tree}:
+A subgraph $T \subseteq G$ that is a tree and includes every vertex of $G$.  A \emph{minimum spanning tree} (MST) minimises the sum of edge weights.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Cross-Component Edge}:
+An edge $(u,v)$ such that $u$ and $v$ lie in different components, i.e., $\textsc{find}(u) \neq \textsc{find}(v)$.
+\end{ppdefn}
+\begin{ppdefn}
+\ppterm{Component}:
+A connected subgraph treated as a unit during Bor\r{u}vka rounds.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Union--Find Structure}:
+A data structure that maintains disjoint sets with operations \textsc{find} and \textsc{union}.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Pointer Jumping}:
+A parallel technique where
+\[
+\texttt{parent}[v] \leftarrow \texttt{parent}[\texttt{parent}[v]]
+\]
+is applied repeatedly to compress paths in union--find.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Bor\r{u}vka Round}:
+An iteration where each component selects its minimum-weight outgoing edge.
+\end{ppdefn}
+
+\begin{ppdefn}
+\ppterm{Parallel Time ($T_p$)}:
+Running time of an algorithm on $p$ processors.
+\end{ppdefn}
