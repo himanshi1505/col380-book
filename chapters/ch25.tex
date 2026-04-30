@@ -858,40 +858,60 @@ You can try an MPI version as well.
 
 \textbf{Solution.}
 A simple OpenMP version is:
+\[
+\begin{array}{l}
+\texttt{\#include <omp.h>} \\
+\texttt{\#include <atomic>} \\
+\texttt{\#include <vector>} \\[2pt]
+\texttt{using std::vector;} \\
+\texttt{using std::atomic;} \\[2pt]
+\texttt{// adj[u] is the adjacency list of u;} \\
+\texttt{// n vertices; source is the BFS source.} \\
+\texttt{vector<vector<int>> adj(n);} \\
+\texttt{vector<atomic<bool>> visited(n);} \\
+\texttt{vector<int> dist(n, -1);} \\
+\texttt{vector<int> frontier = \{source\};} \\[2pt]
+\texttt{visited[source] = true;} \\
+\texttt{dist[source] = 0;} \\
+\texttt{int level = 0;} \\[2pt]
+\texttt{while (!frontier.empty()) \{} \\
+\quad \texttt{vector<int> next\_frontier;} \\
+\quad \texttt{\#pragma omp parallel} \\
+\quad \texttt{\{} \\
+\quad\quad \texttt{vector<int> local\_next;} \\
+\quad\quad \texttt{\#pragma omp for schedule(dynamic) nowait} \\
+\quad\quad \texttt{for (int i = 0;} \\
+\quad\quad\quad\quad \texttt{i < (int)frontier.size(); ++i) \{} \\
+\quad\quad\quad \texttt{int u = frontier[i];} \\
+\quad\quad\quad \texttt{for (int v : adj[u]) \{} \\
+\quad\quad\quad\quad \texttt{bool exp = false;} \\
+\quad\quad\quad\quad \texttt{if (visited[v]} \\
+\quad\quad\quad\quad\quad \texttt{.compare\_exchange\_strong(exp, true))} \\
+\quad\quad\quad\quad \texttt{\{} \\
+\quad\quad\quad\quad\quad \texttt{dist[v] = level + 1;} \\
+
+\end{array}
+\]
+\newpage
 
 \[
-\begin{aligned}
-&\texttt{frontier = \{source\};}\\
-&\texttt{visited[source] = true;}\\
-&\texttt{dist[source] = 0;}\\
-&\texttt{level = 0;}\\
-&\texttt{while (!frontier.empty()) \{}\\
-&\qquad \texttt{next\_frontier.clear();}\\
-&\qquad \texttt{\#pragma omp parallel}\\
-&\qquad \texttt{\{}\\
-&\qquad\qquad \texttt{std::vector<int> local\_next;}\\
-&\qquad\qquad \texttt{\#pragma omp for schedule(dynamic,1) nowait}\\
-&\qquad\qquad \texttt{for (int i = 0; i < frontier.size(); ++i) \{}\\
-&\qquad\qquad\qquad \texttt{int u = frontier[i];}\\
-&\qquad\qquad\qquad \texttt{for (int v : adj[u]) \{}\\
-&\qquad\qquad\qquad\qquad \texttt{bool expected = false;}\\
-&\qquad\qquad\qquad\qquad \texttt{if (visited[v].compare\_exchange\_strong(}\allowbreak\\
-&\qquad\qquad\qquad\qquad\qquad \texttt{expected, true)) \{}
-&\qquad\qquad\qquad\qquad\qquad \texttt{dist[v] = level + 1;}\\
-&\qquad\qquad\qquad\qquad\qquad \texttt{local\_next.push\_back(v);}\\
-&\qquad\qquad\qquad\qquad \texttt{\}}\\
-&\qquad\qquad\qquad \texttt{\}}\\
-&\qquad\qquad \texttt{\}}\\
-&\qquad\qquad \texttt{\#pragma omp critical}\\
-&\qquad\qquad \texttt{next\_frontier.insert(next\_frontier.end(),}\\
-&\qquad\qquad \texttt{local\_next.begin(), local\_next.end());}
-&\qquad \texttt{\}}\\
-&\qquad \texttt{frontier.swap(next\_frontier);}\\
-&\qquad \texttt{++level;}\\
-&\texttt{\}}
-\end{aligned}
+\begin{array}{l}
+\quad\quad\quad\quad\quad \texttt{local\_next.push\_back(v);} \\
+\quad\quad\quad\quad \texttt{\}} \\
+\quad\quad\quad \texttt{\}} \\
+\quad\quad \texttt{\}} \\
+\quad\quad \texttt{\#pragma omp critical} \\
+\quad\quad \texttt{next\_frontier.insert(} \\
+\quad\quad\quad \texttt{next\_frontier.end(),} \\
+\quad\quad\quad \texttt{local\_next.begin(),} \\
+\quad\quad\quad \texttt{local\_next.end());} \\
+\quad \texttt{\}} \\
+\quad \texttt{frontier.swap(next\_frontier);} \\
+\quad \texttt{++level;} \\
+\texttt{\}}
+\end{array}
 \]
-
+Compile with: \texttt{g++-15 -O3 -fopenmp bfs.cpp -o bfs}.
 The key idea is that only one thread can flip \texttt{visited[v]} from false to true, so every vertex enters the next frontier exactly once. You can try MPI as well by distributing frontier vertices across ranks and using message passing for discovered neighbors.
 }
 \end{ppexercise}
